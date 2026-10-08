@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -132,6 +133,101 @@ def candidates(data):
 
     out.sort(key=lambda x: (-x["score"], -x.get("ts", 0)))
     return out
+
+
+# ------------------------------------------------------------- variety / recency
+
+RECENCY_WINDOW = 5        # how many previously posted days to look back at
+RECENCY_PENALTY = 4       # points subtracted per recent appearance of the same family
+MAX_PENALTY_DAYS = 3      # cap so a heavily-repeated family can't drop below everything
+MIN_ALT_SCORE = 5         # an alternative family must score at least this to replace a repeated one
+
+
+def family_of(kind):
+    """Map a story kind to a coarse topic family used for de-duplication."""
+    return {
+        "quake": "quake",
+        "conflict": "conflict",
+        "conflict_event": "conflict",
+        "port": "maritime",
+        "space": "space",
+        "flare": "space",
+        "jamming": "jamming",
+    }.get(kind, "other")
+
+
+def family_from_headline_en(en):
+    """Best-effort family guess from a stored English headline (older posts)."""
+    if en.startswith("Conflict hotspot") or en.startswith("Live event"):
+        return "conflict"
+    if "earthquake" in en:
+        return "quake"
+    if en.startswith("Port congestion"):
+        return "maritime"
+    if en.startswith("Geomagnetic activity") or en.startswith("Solar flare"):
+        return "space"
+    if en.startswith("GPS jamming"):
+        return "jamming"
+    return "other"
+
+
+_H1_RE = re.compile(r"<h1>(.*?)</h1>", re.S)
+
+
+def load_recent_families(posts_dir, today, window=RECENCY_WINDOW):
+    """Count story families over the most recent `window` posted days (excluding today)."""
+    from collections import Counter
+    if not os.path.isdir(posts_dir):
+        return Counter()
+    days = sorted(
+        d for d in os.listdir(posts_dir)
+        if d != today and os.path.isfile(os.path.join(posts_dir, d, "index.zh.html"))
+    )
+    recent = days[-window:]
+    fam = Counter()
+    for d in recent:
+        meta = os.path.join(posts_dir, d, "meta.json")
+        if os.path.isfile(meta):
+            try:
+                with open(meta, encoding="utf-8") as fh:
+                    fam[json.load(fh).get("family", "other")] += 1
+                continue
+            except Exception:
+                pass
+        en = os.path.join(posts_dir, d, "index.en.html")
+        if os.path.isfile(en):
+            try:
+                m = _H1_RE.search(open(en, encoding="utf-8").read())
+                if m:
+                    fam[family_from_headline_en(m.group(1).strip())] += 1
+            except Exception:
+                pass
+    return fam
+
+
+def apply_recency(cands, family_counts):
+    """Re-sort candidates after penalising recently-shown families for variety."""
+    for c in cands:
+        fam = family_of(c["kind"])
+        c["family"] = fam
+        c["penalty"] = min(family_counts.get(fam, 0), MAX_PENALTY_DAYS) * RECENCY_PENALTY
+        c["adj"] = c["score"] - c["penalty"]
+    cands.sort(key=lambda x: (-x["adj"], -x["score"], -x.get("ts", 0)))
+    return cands
+
+
+def pick_story(cands, recent_families):
+    """Pick the top candidate, but if its family was shown recently, switch to the
+    best candidate from a different family so the same topic doesn't repeat daily."""
+    if not cands:
+        return None
+    top = cands[0]
+    if recent_families.get(top["family"], 0) == 0:
+        return top
+    for c in cands:
+        if recent_families.get(c["family"], 0) == 0 and c["adj"] >= MIN_ALT_SCORE:
+            return c
+    return top
 
 
 # ------------------------------------------------------------- narration
@@ -352,9 +448,12 @@ def main():
     today = a.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     gen_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    recent_families = load_recent_families(os.path.join(ROOT, "posts"), today)
+
     print(f"[*] fetching OSIRIS feeds for {today} ...")
     data = load_all()
     cands = candidates(data)
+    cands = apply_recency(cands, recent_families)
     if not cands:
         print("[!] no candidate story found (feeds may be empty/unreachable). Writing a 'no signal' post.")
         story = {
@@ -367,8 +466,12 @@ def main():
             "facts_zh": [("状态", "无信号")], "facts_en": [("Status", "no signal")],
         }
     else:
-        story = cands[0]
-        print(f"[*] picked: {story['headline_en']} (score {story['score']})")
+        story = pick_story(cands, recent_families)
+        pen = story.get("penalty", 0)
+        switched = story is not cands[0]
+        tag = f" (raw {story['score']}, -{pen} recency)"
+        tag += " [family-switch: recent top family repeated]" if switched else ""
+        print(f"[*] picked: {story['headline_en']} (adj {story['adj']}{tag})")
         content = narrate(story, data)
 
     out_dir = os.path.join(ROOT, "posts", today)
@@ -379,6 +482,19 @@ def main():
         f.write(zh)
     with open(os.path.join(out_dir, "index.en.html"), "w", encoding="utf-8") as f:
         f.write(en)
+
+    # persist a small metadata record so future runs can avoid repeating the same family
+    meta = {
+        "date": today,
+        "family": story.get("family", family_of(story["kind"])),
+        "kind": story["kind"],
+        "headline_en": story["headline_en"],
+        "headline_zh": story["headline_zh"],
+        "score": story["score"],
+        "adj": story.get("adj", story["score"]),
+    }
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
     # rebuild master index from whatever day-folders exist
     days = sorted(d for d in os.listdir(os.path.join(ROOT, "posts"))
