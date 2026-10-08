@@ -21,6 +21,19 @@ python3 generate_brief.py                 # today
 python3 generate_brief.py --date 2026-10-07   # backfill a day
 ```
 
+## Back-fill a missed day
+
+If a day was skipped (network or API down), regenerate it and push with the
+resilient helper. `push_brief.py` commits using the correct per-user no-reply
+identity (`281093441+Franky100-pig@users.noreply.github.com`, so it attributes
+to **Franky100-pig**, not the `web-flow` bot) and pushes via `git`, auto-falling
+back to the GitHub REST API when the sandbox proxy blocks git transport:
+
+```bash
+python3 generate_brief.py --date YYYY-MM-DD
+python3 push_brief.py "daily brief YYYY-MM-DD"
+```
+
 ## Reading it
 
 Open `index.html` for the archive, or `posts/<date>/index.zh.html` (中文) /
