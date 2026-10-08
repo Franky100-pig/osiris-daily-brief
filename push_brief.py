@@ -37,7 +37,10 @@ def run(cmd, **kw):
 
 def gh_api(method, path, data=None):
     cmd = [GH, "api", "-X", method, f"/repos/{REPO}{path}"]
-    inp = json.dumps(data) if data is not None else None
+    inp = None
+    if data is not None:
+        cmd += ["--input", "-"]
+        inp = json.dumps(data)
     return subprocess.run(cmd, input=inp, capture_output=True, text=True)
 
 
