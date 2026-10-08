@@ -1,0 +1,7 @@
+# Never commit automation internals / secrets to the public repo.
+# Keeps `git add -A` safe (the daily automation relies on it).
+.workbuddy/
+
+# Python caches
+__pycache__/
+*.pyc
