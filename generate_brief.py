@@ -337,6 +337,14 @@ PAGE = """<!DOCTYPE html><html lang="__LANG__"><head><meta charset="utf-8">
  .stats{display:flex;flex-wrap:wrap;gap:10px;margin:26px 0 8px;}
  .chip{background:#121821;border:1px solid #1e2630;border-radius:9px;padding:9px 13px;font-size:13px;}
  .chip b{color:#4db8ff;font-variant-numeric:tabular-nums;}
+ .others{margin:24px 0 6px;border-top:1px solid #1a222c;padding-top:18px;}
+ .others-h{color:#7d8b9a;font:600 12px/1 ui-monospace,monospace;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:10px;}
+ .others ul{list-style:none;margin:0;padding:0;}
+ .others li{display:flex;align-items:baseline;gap:10px;padding:7px 0;border-bottom:1px solid #131a22;font-size:14px;}
+ .others .fam{color:#4db8ff;font-size:12px;min-width:84px;flex:none;}
+ .others .ot{color:#c2cedb;flex:1;}
+ .others .sc{color:#7d8b9a;font-variant-numeric:tabular-nums;font-size:12.5px;flex:none;}
+ .others-note{color:#52606d;font-size:12px;margin-top:10px;}
  a{color:#4db8ff;text-decoration:none;} a:hover{text-decoration:underline;}
  .src{color:#6f7d8b;font-size:12.5px;margin-top:30px;border-top:1px solid #1a222c;padding-top:16px;}
  .lang{position:fixed;top:18px;right:20px;font-size:12.5px;}
@@ -351,6 +359,7 @@ PAGE = """<!DOCTYPE html><html lang="__LANG__"><head><meta charset="utf-8">
  <table class="facts">__FACTS__</table>
  <div class="note"><b>为什么值得记：</b> __WHY__</div>
  <div class="stats">__CHIPS__</div>
+ __OTHERS__
  <div class="src">Sources: __SOURCES__</div>
  <footer>OSIRIS Daily Brief — auto-generated. Figures are a point-in-time snapshot of public keyless feeds
  (USGS, NASA FIRMS, OpenSky, national traffic-camera networks). Not an authoritative intelligence source.</footer>
@@ -391,7 +400,38 @@ def sources_line(story):
     return " · ".join(urls)
 
 
-def render(lang, story, content, data, date_str, gen_str):
+def render_others(others, lang):
+    """Bilingual snapshot of the day's other notable families (never the headline family)."""
+    if not others:
+        return ""
+    head = {"zh": "今日其他信号", "en": "Other signals today"}[lang]
+    fam_label = {
+        "quake": {"zh": "地震", "en": "Earthquakes"},
+        "conflict": {"zh": "冲突", "en": "Conflicts"},
+        "maritime": {"zh": "航运", "en": "Maritime"},
+        "space": {"zh": "空间天气", "en": "Space weather"},
+        "jamming": {"zh": "航空干扰", "en": "Aviation jamming"},
+        "other": {"zh": "其他", "en": "Other"},
+    }
+    items = []
+    for c in others:
+        fam = c.get("family") or family_of(c["kind"])
+        fl = fam_label.get(fam, {"zh": "其他", "en": "Other"})[lang]
+        title = c[f"headline_{lang}"]
+        sc = c.get("score", 0)
+        items.append(
+            f'<li><span class="fam">{fl}</span>'
+            f'<span class="ot">{title}</span>'
+            f'<span class="sc">{sc:.1f}</span></li>'
+        )
+    note = ("仅作快照，不计入头条评分。" if lang == "zh"
+            else "Snapshot only — not part of the headline score.")
+    return (f'<div class="others"><div class="others-h">{head}</div>'
+            f'<ul>{"".join(items)}</ul>'
+            f'<div class="others-note">{note}</div></div>')
+
+
+def render(lang, story, content, data, date_str, gen_str, others=None):
     kind_label = {"zh": "每日简报", "en": "Daily Brief"}[lang]
     other = "index.en.html" if lang == "zh" else "index.zh.html"
     other_label = "English" if lang == "zh" else "中文"
@@ -405,6 +445,7 @@ def render(lang, story, content, data, date_str, gen_str):
         ("__DATE__", date_str), ("__GEN__", gen_str), ("__BODY__", body),
         ("__FACTS__", facts), ("__WHY__", why_text(story)),
         ("__CHIPS__", stats_chips(data.get("stats"))),
+        ("__OTHERS__", render_others(others or [], lang)),
         ("__SOURCES__", sources_line(story)),
     ):
         html = html.replace(tok, str(val))
@@ -474,10 +515,23 @@ def main():
         print(f"[*] picked: {story['headline_en']} (adj {story['adj']}{tag})")
         content = narrate(story, data)
 
+    # "other signals" snapshot: the top candidate of every family except the chosen one
+    others = []
+    chosen_fam = story.get("family") or family_of(story["kind"])
+    if cands:
+        best = {}
+        for c in cands:
+            fam = c.get("family") or family_of(c["kind"])
+            if fam == chosen_fam:
+                continue
+            if fam not in best or c["adj"] > best[fam]["adj"]:
+                best[fam] = c
+        others = sorted(best.values(), key=lambda x: -x["adj"])[:6]
+
     out_dir = os.path.join(ROOT, "posts", today)
     os.makedirs(out_dir, exist_ok=True)
-    zh = render("zh", story, content, data, today, gen_str)
-    en = render("en", story, content, data, today, gen_str)
+    zh = render("zh", story, content, data, today, gen_str, others)
+    en = render("en", story, content, data, today, gen_str, others)
     with open(os.path.join(out_dir, "index.zh.html"), "w", encoding="utf-8") as f:
         f.write(zh)
     with open(os.path.join(out_dir, "index.en.html"), "w", encoding="utf-8") as f:

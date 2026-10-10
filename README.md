@@ -21,6 +21,44 @@ python3 generate_brief.py                 # today
 python3 generate_brief.py --date 2026-10-07   # backfill a day
 ```
 
+## Scoring mechanism（评分机制）
+
+The daily headline is the single most notable candidate after a three-layer process.
+The headline is chosen by a three-layer process; the "Other signals" section on each
+post page is a separate snapshot and is **not** part of this score.
+
+每日头条经由三层流程选出；帖子页里的「今日其他信号」是独立快照，**不计入**该评分。
+
+### Layer 1 — raw score per event（`candidates()`）
+
+| Source | Raw score |
+| --- | --- |
+| Earthquake M4.5+ | `magnitude + (6 if tsunami) + (3 if alert)` |
+| Conflict zone | by severity: war=12, high=9, medium=6, low=3 (default 4) |
+| Conflict live event | flat **11** |
+| Port congestion | HIGH=8, SEVERE=10, CRITICAL=11 (default 6) |
+| Geomagnetic storm (non-Quiet) | flat **7** |
+| Solar flare | by class letter: X=13, M=10, C=5 (default 3) |
+| GPS jamming (any report) | flat **9** |
+
+### Layer 2 — recency / variety penalty（`apply_recency`）
+
+- Looks back over the last `RECENCY_WINDOW = 5` posted days (excluding today).
+- Penalty = `min(recent_appearances, MAX_PENALTY_DAYS=3) × RECENCY_PENALTY=4`
+  → a family seen 1 / 2 / 3 times in the window gets −4 / −8 / −12 (capped at −12).
+- `adj = score − penalty`, then re-sorted by `(-adj, -score, -ts)`.
+
+### Layer 3 — final pick（`pick_story`）
+
+1. Take the highest-`adj` candidate.
+2. If its family was **not** shown recently → it wins.
+3. If it **was** shown recently → switch to the first candidate whose family is
+   unused recently **and** `adj ≥ MIN_ALT_SCORE=5`.
+4. If no qualifying alternative exists → keep the original top (even if repeated).
+
+Families: `quake` · `conflict` (zone + live event) · `maritime` (port) ·
+`space` (storm + flare) · `jamming`.
+
 ## Back-fill a missed day
 
 If a day was skipped (network or API down), regenerate it and push with the
