@@ -230,6 +230,31 @@ def pick_story(cands, recent_families):
     return top
 
 
+def find_urgent(cands, keyword):
+    """Find the best candidate mentioning `keyword` (case-insensitive). Prefers
+    live conflict events over standing conflict zones. Returns a candidate dict
+    or None (caller falls back to the algorithm — never invents data)."""
+    kw = (keyword or "").lower().strip()
+    if not kw or not cands:
+        return None
+
+    def matches(c):
+        blob = " ".join(str(c.get(k, "")) for k in ("headline_en", "headline_zh"))
+        raw = c.get("raw") or {}
+        if isinstance(raw, dict):
+            blob += " " + " ".join(str(raw.get(k, "")) for k in
+                                   ("title", "label", "name", "description", "summary", "region"))
+        return kw in blob.lower()
+
+    hits = [c for c in cands if matches(c)]
+    if not hits:
+        return None
+    # prefer live events over standing zones, then by adjusted score
+    hits.sort(key=lambda c: (0 if c["kind"] == "conflict_event" else 1,
+                             -c.get("adj", c["score"])))
+    return hits[0]
+
+
 # ------------------------------------------------------------- narration
 
 def narrate(story, data):
@@ -365,6 +390,19 @@ PAGE = """<!DOCTYPE html><html lang="__LANG__"><head><meta charset="utf-8">
  (USGS, NASA FIRMS, OpenSky, national traffic-camera networks). Not an authoritative intelligence source.</footer>
 </div></body></html>"""
 
+# Extra CSS injected only for urgent/breaking posts (kept separate so the base
+# template stays the same for every ordinary day).
+URGENT_CSS = """
+ .kicker{color:#ff6b6b;}
+ .wrap{border-left:3px solid #ff5b5b;box-shadow: inset 0 0 90px #ff00000d;}
+ body{background: radial-gradient(1200px 600px at 70% -10%,#2a1216,#0b0f14 60%);}
+ .breaking{display:inline-flex;align-items:center;gap:8px;background:#2a0d12;border:1px solid #ff5b5b55;
+   color:#ff6b6b;font:700 12px/1 ui-monospace,monospace;letter-spacing:1.5px;text-transform:uppercase;
+   padding:7px 12px;border-radius:8px;margin-bottom:14px;}
+ .breaking .dot{width:8px;height:8px;border-radius:50%;background:#ff4d4d;box-shadow:0 0 9px #ff4d4d;animation:pulse 1.4s infinite;}
+ @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.35;}}
+"""
+
 
 def why_text(story):
     k = story["kind"]
@@ -431,7 +469,7 @@ def render_others(others, lang):
             f'<div class="others-note">{note}</div></div>')
 
 
-def render(lang, story, content, data, date_str, gen_str, others=None):
+def render(lang, story, content, data, date_str, gen_str, others=None, urgent=False, urgent_text=""):
     kind_label = {"zh": "每日简报", "en": "Daily Brief"}[lang]
     other = "index.en.html" if lang == "zh" else "index.zh.html"
     other_label = "English" if lang == "zh" else "中文"
@@ -447,8 +485,14 @@ def render(lang, story, content, data, date_str, gen_str, others=None):
         ("__CHIPS__", stats_chips(data.get("stats"))),
         ("__OTHERS__", render_others(others or [], lang)),
         ("__SOURCES__", sources_line(story)),
+        ("__URGENTTEXT__", urgent_text),
     ):
         html = html.replace(tok, str(val))
+    if urgent:
+        html = html.replace('<div class="wrap">',
+                             '<div class="wrap">\n <div class="breaking"><span class="dot"></span>__URGENTTEXT__</div>', 1)
+        html = html.replace('</style>', URGENT_CSS + '\n</style>', 1)
+        html = html.replace('__URGENTTEXT__', urgent_text)
     return html
 
 
@@ -457,7 +501,15 @@ def render(lang, story, content, data, date_str, gen_str, others=None):
 def build_index(posted_days):
     rows = ""
     for day in sorted(posted_days, reverse=True):
-        rows += (f'<tr><td>{day}</td>'
+        meta_path = os.path.join(ROOT, "posts", day, "meta.json")
+        urgent = False
+        if os.path.isfile(meta_path):
+            try:
+                urgent = bool(json.load(open(meta_path, encoding="utf-8")).get("urgent"))
+            except Exception:
+                pass
+        tag = ' <span class="urg">紧急</span>' if urgent else ""
+        rows += (f'<tr><td>{day}{tag}</td>'
                  f'<td><a href="posts/{day}/index.zh.html">中文</a> · '
                  f'<a href="posts/{day}/index.en.html">English</a></td></tr>')
     html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
@@ -471,6 +523,7 @@ def build_index(posted_days):
  table{{width:100%;border-collapse:collapse;}}
  td{{padding:11px 12px;border-bottom:1px solid #1a222c;}}
  a{{color:#4db8ff;text-decoration:none;}} a:hover{{text-decoration:underline;}}
+ .urg{{color:#ff6b6b;font:600 11px/1 ui-monospace,monospace;margin-left:6px;}}
 </style></head><body><div class="wrap">
 <h1>OSIRIS Daily Brief</h1>
 <div class="sub">每日从 osirisai.live 公开 API 自动生成的全球态势简报 · 中英双语</div>
@@ -484,6 +537,8 @@ def build_index(posted_days):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="YYYY-MM-DD (default: today)")
+    ap.add_argument("--urgent", help="Force a story mentioning KEYWORD as an urgent/breaking headline "
+                                      "(overrides the algorithm). Falls back to the algorithm if no match.")
     a = ap.parse_args()
 
     today = a.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -495,6 +550,14 @@ def main():
     data = load_all()
     cands = candidates(data)
     cands = apply_recency(cands, recent_families)
+
+    # --- urgent override (explicit instruction only; algorithm otherwise untouched) ---
+    urgent = bool(a.urgent)
+    urgent_story = find_urgent(cands, a.urgent) if urgent else None
+    if urgent and urgent_story is None:
+        print(f"[!] --urgent '{a.urgent}' matched nothing in current feeds; falling back to the algorithm.")
+        urgent = False
+
     if not cands:
         print("[!] no candidate story found (feeds may be empty/unreachable). Writing a 'no signal' post.")
         story = {
@@ -507,13 +570,24 @@ def main():
             "facts_zh": [("状态", "无信号")], "facts_en": [("Status", "no signal")],
         }
     else:
-        story = pick_story(cands, recent_families)
-        pen = story.get("penalty", 0)
-        switched = story is not cands[0]
-        tag = f" (raw {story['score']}, -{pen} recency)"
-        tag += " [family-switch: recent top family repeated]" if switched else ""
-        print(f"[*] picked: {story['headline_en']} (adj {story['adj']}{tag})")
-        content = narrate(story, data)
+        if urgent and urgent_story:
+            story = urgent_story
+            story["urgent"] = True
+            # strip the generic "Live event:" / "实时战况：" prefix for a clean headline
+            story["headline_en"] = re.sub(r'^Live event:\s*', '', story["headline_en"])
+            story["headline_zh"] = re.sub(r'^实时战况：\s*', '', story["headline_zh"])
+            print(f"[*] URGENT override: {story['headline_en']}")
+            content = narrate(story, data)
+            content["en"].insert(0, "This is a fast-moving situation — the details below are a point-in-time snapshot from public OSIRIS feeds.")
+            content["zh"].insert(0, "⚠ 这是一则突发进展，以下内容为公开 OSIRIS feed 在当前时间点的快照。")
+        else:
+            story = pick_story(cands, recent_families)
+            pen = story.get("penalty", 0)
+            switched = story is not cands[0]
+            tag = f" (raw {story['score']}, -{pen} recency)"
+            tag += " [family-switch: recent top family repeated]" if switched else ""
+            print(f"[*] picked: {story['headline_en']} (adj {story['adj']}{tag})")
+            content = narrate(story, data)
 
     # "other signals" snapshot: the top candidate of every family except the chosen one
     others = []
@@ -530,8 +604,9 @@ def main():
 
     out_dir = os.path.join(ROOT, "posts", today)
     os.makedirs(out_dir, exist_ok=True)
-    zh = render("zh", story, content, data, today, gen_str, others)
-    en = render("en", story, content, data, today, gen_str, others)
+    is_urgent = bool(story.get("urgent"))
+    zh = render("zh", story, content, data, today, gen_str, others, urgent=is_urgent, urgent_text="紧急")
+    en = render("en", story, content, data, today, gen_str, others, urgent=is_urgent, urgent_text="BREAKING")
     with open(os.path.join(out_dir, "index.zh.html"), "w", encoding="utf-8") as f:
         f.write(zh)
     with open(os.path.join(out_dir, "index.en.html"), "w", encoding="utf-8") as f:
@@ -546,6 +621,7 @@ def main():
         "headline_zh": story["headline_zh"],
         "score": story["score"],
         "adj": story.get("adj", story["score"]),
+        "urgent": bool(story.get("urgent", False)),
     }
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
