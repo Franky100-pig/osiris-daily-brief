@@ -142,6 +142,13 @@ RECENCY_PENALTY = 4       # points subtracted per recent appearance of the same 
 MAX_PENALTY_DAYS = 3      # cap so a heavily-repeated family can't drop below everything
 MIN_ALT_SCORE = 5         # an alternative family must score at least this to replace a repeated one
 
+# Per-specific-story recency: a headline that was literally shown recently (e.g. the
+# standing "UKRAINE WAR" zone, which always scores 12) must be demoted so the brief does
+# not repeat the SAME story day after day. Family penalty alone is too weak for standing
+# zones, because they top the raw score and the fallback keeps returning them.
+LABEL_RECENCY_PENALTY = 7   # points off if the exact same headline_en appeared recently
+MAX_LABEL_PENALTY_DAYS = 2  # cap the per-headline penalty so it can't drop below everything
+
 
 def family_of(kind):
     """Map a story kind to a coarse topic family used for de-duplication."""
@@ -205,13 +212,50 @@ def load_recent_families(posts_dir, today, window=RECENCY_WINDOW):
     return fam
 
 
-def apply_recency(cands, family_counts):
-    """Re-sort candidates after penalising recently-shown families for variety."""
+def load_recent_headlines(posts_dir, today, window=RECENCY_WINDOW):
+    """Count exact English headlines over the most recent `window` posted days
+    (excluding today). Used to demote a story that was literally shown recently,
+    which the family-level penalty cannot catch for permanent standing zones."""
+    from collections import Counter
+    if not os.path.isdir(posts_dir):
+        return Counter()
+    days = sorted(
+        d for d in os.listdir(posts_dir)
+        if d != today and os.path.isfile(os.path.join(posts_dir, d, "index.zh.html"))
+    )
+    recent = days[-window:]
+    cnt = Counter()
+    for d in recent:
+        meta = os.path.join(posts_dir, d, "meta.json")
+        if os.path.isfile(meta):
+            try:
+                cnt[json.load(open(meta, encoding="utf-8")).get("headline_en", "")] += 1
+                continue
+            except Exception:
+                pass
+        en = os.path.join(posts_dir, d, "index.en.html")
+        if os.path.isfile(en):
+            try:
+                m = _H1_RE.search(open(en, encoding="utf-8").read())
+                if m:
+                    cnt[m.group(1).strip()] += 1
+            except Exception:
+                pass
+    return cnt
+
+
+def apply_recency(cands, family_counts, headline_counts=None):
+    """Re-sort candidates after penalising recently-shown families (topic variety)
+    AND recently-shown specific headlines (so the SAME standing story, e.g. UKRAINE
+    WAR, cannot repeat day after day)."""
+    headline_counts = headline_counts or {}
     for c in cands:
         fam = family_of(c["kind"])
         c["family"] = fam
         c["penalty"] = min(family_counts.get(fam, 0), MAX_PENALTY_DAYS) * RECENCY_PENALTY
-        c["adj"] = c["score"] - c["penalty"]
+        hc = headline_counts.get(c["headline_en"], 0)
+        c["label_penalty"] = min(hc, MAX_LABEL_PENALTY_DAYS) * LABEL_RECENCY_PENALTY
+        c["adj"] = c["score"] - c["penalty"] - c["label_penalty"]
     cands.sort(key=lambda x: (-x["adj"], -x["score"], -x.get("ts", 0)))
     return cands
 
@@ -545,11 +589,12 @@ def main():
     gen_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     recent_families = load_recent_families(os.path.join(ROOT, "posts"), today)
+    recent_headlines = load_recent_headlines(os.path.join(ROOT, "posts"), today)
 
     print(f"[*] fetching OSIRIS feeds for {today} ...")
     data = load_all()
     cands = candidates(data)
-    cands = apply_recency(cands, recent_families)
+    cands = apply_recency(cands, recent_families, recent_headlines)
 
     # --- urgent override (explicit instruction only; algorithm otherwise untouched) ---
     urgent = bool(a.urgent)
@@ -583,8 +628,9 @@ def main():
         else:
             story = pick_story(cands, recent_families)
             pen = story.get("penalty", 0)
+            lpen = story.get("label_penalty", 0)
             switched = story is not cands[0]
-            tag = f" (raw {story['score']}, -{pen} recency)"
+            tag = f" (raw {story['score']}, -{pen} family, -{lpen} same-headline)"
             tag += " [family-switch: recent top family repeated]" if switched else ""
             print(f"[*] picked: {story['headline_en']} (adj {story['adj']}{tag})")
             content = narrate(story, data)

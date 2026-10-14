@@ -44,9 +44,15 @@ post page is a separate snapshot and is **not** part of this score.
 ### Layer 2 — recency / variety penalty（`apply_recency`）
 
 - Looks back over the last `RECENCY_WINDOW = 5` posted days (excluding today).
-- Penalty = `min(recent_appearances, MAX_PENALTY_DAYS=3) × RECENCY_PENALTY=4`
+- **Family penalty** = `min(recent_appearances, MAX_PENALTY_DAYS=3) × RECENCY_PENALTY=4`
   → a family seen 1 / 2 / 3 times in the window gets −4 / −8 / −12 (capped at −12).
-- `adj = score − penalty`, then re-sorted by `(-adj, -score, -ts)`.
+- **Same-headline penalty** = `min(recent_headline_appearances, MAX_LABEL_PENALTY_DAYS=2) ×
+  LABEL_RECENCY_PENALTY=7`. This catches *permanent standing zones* (e.g. the OSIRIS
+  "UKRAINE WAR" conflict zone, which always scores 12) that the family penalty alone
+  cannot stop from repeating — a headline literally shown recently is demoted so the
+  brief rotates to a different story.
+- `adj = score − family_penalty − same_headline_penalty`, then re-sorted by
+  `(-adj, -score, -ts)`.
 
 ### Layer 3 — final pick（`pick_story`）
 
@@ -55,6 +61,8 @@ post page is a separate snapshot and is **not** part of this score.
 3. If it **was** shown recently → switch to the first candidate whose family is
    unused recently **and** `adj ≥ MIN_ALT_SCORE=5`.
 4. If no qualifying alternative exists → keep the original top (even if repeated).
+   (The same-headline penalty in Layer 2 already makes a repeated standing zone drop
+   below fresh alternatives, so rule 4 rarely re-selects an identical story.)
 
 Families: `quake` · `conflict` (zone + live event) · `maritime` (port) ·
 `space` (storm + flare) · `jamming`.
