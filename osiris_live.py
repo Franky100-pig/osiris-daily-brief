@@ -86,13 +86,13 @@ def ts_to_str(ms_or_iso, ms: bool = False) -> str:
         return str(ms_or_iso)
 
 
-def ago(ms: int) -> str:
+def ago(ms: int, lang: str = "en") -> str:
     mins = (datetime.now(tz=timezone.utc).timestamp() * 1000 - ms) / 60000
     if mins < 60:
-        return f"{mins:.0f}m ago"
+        return f"{mins:.0f} 分钟前" if lang == "zh" else f"{mins:.0f}m ago"
     if mins < 1440:
-        return f"{mins / 60:.1f}h ago"
-    return f"{mins / 1440:.1f}d ago"
+        return f"{mins / 60:.1f} 小时前" if lang == "zh" else f"{mins / 60:.1f}h ago"
+    return f"{mins / 1440:.1f} 天前" if lang == "zh" else f"{mins / 1440:.1f}d ago"
 
 
 # ---------------------------------------------------------------- commands

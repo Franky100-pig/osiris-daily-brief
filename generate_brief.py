@@ -311,16 +311,17 @@ def narrate(story, data):
     if kind == "quake":
         e = raw
         place, m = e.get("place", "未知"), e.get("magnitude", 0)
-        when = O.ago(e.get("time", 0))
-        zh.append(f"今日最值得记录的地球动态，是一次里氏 {m:.1f} 级地震，发生于{place}，约 {when}。")
+        when_zh = O.ago(e.get("time", 0), "zh")
+        when_en = O.ago(e.get("time", 0), "en")
+        zh.append(f"今日最值得记录的地球动态，是一次里氏 {m:.1f} 级地震，发生于{place}，约 {when_zh}。")
         zh.append("地震本身是板块运动的常态，但震级、震源深度与是否触发海啸预警，决定了它是否值得普通人关注。")
-        en.append(f"The headline event today is a M{m:.1f} earthquake near {place}, roughly {when} ago.")
+        en.append(f"The headline event today is a M{m:.1f} earthquake near {place}, roughly {when_en}.")
         en.append("Quakes are routine tectonics; magnitude, depth and any tsunami flag are what make one worth a mention.")
         facts_zh = [("位置", place), ("震级", f"M{m:.1f}"), ("深度", f"{e.get('depth', 0):.0f} km"),
-                    ("发生时间", when), ("海啸", "是" if e.get("tsunami") else "否"),
+                    ("发生时间", when_zh), ("海啸", "是" if e.get("tsunami") else "否"),
                     ("USGS 详情", e.get("url", ""))]
         facts_en = [("Location", place), ("Magnitude", f"M{m:.1f}"), ("Depth", f"{e.get('depth', 0):.0f} km"),
-                    ("When", when), ("Tsunami", "yes" if e.get("tsunami") else "no"),
+                    ("When", when_en), ("Tsunami", "yes" if e.get("tsunami") else "no"),
                     ("USGS", e.get("url", ""))]
 
     elif kind in ("conflict", "conflict_event"):
@@ -338,7 +339,9 @@ def narrate(story, data):
         facts_en = [("Region", z.get("region") or label), ("Severity", z.get("severity") or "-"),
                     ("Source", z.get("sourceUrl") or z.get("source") or "")]
         if desc:
-            facts_zh.append(("原描述(EN)", desc))
+            # The original OSIRIS description is free English text we cannot
+            # reliably translate offline, so it is shown only on the EN page to
+            # keep the ZH page free of English prose.
             facts_en.append(("Description", desc))
 
     elif kind == "port":
@@ -388,7 +391,7 @@ def narrate(story, data):
 
 PAGE = """<!DOCTYPE html><html lang="__LANG__"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__TITLE__ · OSIRIS Daily Brief</title>
+<title>__TITLE__ · __BRAND__</title>
 <style>
  :root{color-scheme:dark;}
  body{margin:0;background: radial-gradient(1200px 600px at 70% -10%,#13202e,#0b0f14 60%);
@@ -421,17 +424,16 @@ PAGE = """<!DOCTYPE html><html lang="__LANG__"><head><meta charset="utf-8">
 </style></head><body>
 <div class="lang"><a href="__OTHER__">__OTHERLABEL__</a></div>
 <div class="wrap">
- <div class="kicker">OSIRIS Daily Brief · __KIND__</div>
+ <div class="kicker">__BRAND__</div>
  <h1>__TITLE__</h1>
- <div class="date">__DATE__ · generated __GEN__ from public osirisai.live feeds</div>
+ <div class="date">__DATELINE__</div>
  <div class="lead">__BODY__</div>
  <table class="facts">__FACTS__</table>
- <div class="note"><b>为什么值得记：</b> __WHY__</div>
+ <div class="note"><b>__NOTELABEL__</b> __WHY__</div>
  <div class="stats">__CHIPS__</div>
  __OTHERS__
- <div class="src">Sources: __SOURCES__</div>
- <footer>OSIRIS Daily Brief — auto-generated. Figures are a point-in-time snapshot of public keyless feeds
- (USGS, NASA FIRMS, OpenSky, national traffic-camera networks). Not an authoritative intelligence source.</footer>
+ <div class="src">__SOURCES__</div>
+ <footer>__FOOTER__</footer>
 </div></body></html>"""
 
 # Extra CSS injected only for urgent/breaking posts (kept separate so the base
@@ -448,9 +450,9 @@ URGENT_CSS = """
 """
 
 
-def why_text(story):
+def why_text(story, lang="zh"):
     k = story["kind"]
-    base = {
+    zh = {
         "quake": "震级、深度与海啸标志共同决定一次地震的实际影响面，是普通人最容易理解、也最值得长期追踪的全球动态之一。",
         "conflict": "冲突热点直接关联航运咽喉、能源与难民流动，是地缘与市场的早期信号。",
         "conflict_event": "实时战况事件往往先于主流媒体报道，是开源情报的价值所在。",
@@ -458,28 +460,47 @@ def why_text(story):
         "space": "地磁活动影响卫星与通信，强风暴期间高纬度短波与定位会受扰。",
         "flare": "太阳耀斑可扰动高频通信与 GNSS 定位，规模越大、影响越广。",
         "jamming": "GPS 干扰反映局部空域的异常电磁环境，常与军事活动相关。",
+        "none": "这是当天所有可用信号中显著性最高的一条。",
     }
-    return base.get(k, "这是当天所有可用信号中显著性最高的一条。")
+    en = {
+        "quake": "Magnitude, depth and the tsunami flag together determine a quake's real impact — one of the most accessible global signals for ordinary people to track over time.",
+        "conflict": "Conflict hotspots are tied directly to shipping chokepoints, energy and migration — early signals for geopolitics and markets.",
+        "conflict_event": "Live conflict events often break ahead of mainstream coverage — the core value of open-source intelligence.",
+        "port": "Major-port congestion cascades through supply chains, hitting lead times and freight rates — a leading macro and trade indicator.",
+        "space": "Geomagnetic activity affects satellites and comms; strong storms disrupt high-latitude HF radio and positioning.",
+        "flare": "Solar flares disturb HF comms and GNSS positioning; the larger the class, the wider the reach.",
+        "jamming": "GPS jamming reveals an anomalous electromagnetic environment in local airspace, often linked to military activity.",
+        "none": "This is the single most salient signal among all available feeds for the day.",
+    }
+    table = zh if lang == "zh" else en
+    return table.get(k, table["none"])
 
 
-def stats_chips(stats):
+def stats_chips(stats, lang="zh"):
     if not isinstance(stats, dict) or "stats" not in stats:
         return ""
     s = stats["stats"]
-    items = [("航班", s.get("flights")), ("卫星", s.get("sats")),
-             ("摄像头", s.get("cctv")), ("事件", s.get("incidents"))]
+    labels = {"zh": ("航班", "卫星", "摄像头", "事件"),
+              "en": ("Flights", "Satellites", "Cameras", "Incidents")}[lang]
+    items = list(zip(labels, (s.get("flights"), s.get("sats"),
+                              s.get("cctv"), s.get("incidents"))))
     return "".join(f'<div class="chip"><b>{v:,}</b> {k}</div>' for k, v in items if v is not None)
 
 
-def sources_line(story):
+def sources_line(story, lang="zh"):
+    from urllib.parse import urlparse
     raw = story["raw"]
-    urls = []
+    hosts = []
     for key in ("url", "sourceUrl", "external_url"):
         if isinstance(raw, dict) and raw.get(key):
-            urls.append(f'<a href="{raw[key]}" target="_blank">{key}</a>')
-    if not urls:
-        urls.append('<a href="https://www.osirisai.live" target="_blank">osirisai.live</a>')
-    return " · ".join(urls)
+            try:
+                hosts.append(f'<a href="{raw[key]}" target="_blank">{urlparse(raw[key]).netloc}</a>')
+            except Exception:
+                hosts.append(f'<a href="{raw[key]}" target="_blank">{raw[key]}</a>')
+    if not hosts:
+        hosts.append('<a href="https://www.osirisai.live" target="_blank">osirisai.live</a>')
+    label = "来源：" if lang == "zh" else "Sources: "
+    return label + " · ".join(hosts)
 
 
 def render_others(others, lang):
@@ -514,21 +535,33 @@ def render_others(others, lang):
 
 
 def render(lang, story, content, data, date_str, gen_str, others=None, urgent=False, urgent_text=""):
-    kind_label = {"zh": "每日简报", "en": "Daily Brief"}[lang]
     other = "index.en.html" if lang == "zh" else "index.zh.html"
     other_label = "English" if lang == "zh" else "中文"
+    brand = {"zh": "OSIRIS 每日简报", "en": "OSIRIS Daily Brief"}[lang]
+    dateline = (f"{date_str} · 生成于 {gen_str} · 数据来自 osirisai.live 公开 feed"
+                if lang == "zh"
+                else f"{date_str} · generated {gen_str} from public osirisai.live feeds")
+    notelabel = "为什么值得记：" if lang == "zh" else "Why it matters: "
+    footer = ("OSIRIS 每日简报 — 自动生成。数据来自公开免密钥 feed（USGS、NASA FIRMS、OpenSky、"
+              "各国交通监控网络）的瞬时快照，并非权威情报来源。"
+              if lang == "zh" else
+              "OSIRIS Daily Brief — auto-generated. Figures are a point-in-time snapshot of public "
+              "keyless feeds (USGS, NASA FIRMS, OpenSky, national traffic-camera networks). "
+              "Not an authoritative intelligence source.")
     body = "".join(f"<p>{p}</p>" for p in content[lang])
     facts = "".join(f"<tr><td>{k}</td><td>{v if v is not None else ''}</td></tr>"
                     for k, v in content[f"facts_{lang}"])
     html = PAGE
     for tok, val in (
         ("__LANG__", lang), ("__TITLE__", story[f"headline_{lang}"]),
-        ("__KIND__", kind_label), ("__OTHER__", other), ("__OTHERLABEL__", other_label),
-        ("__DATE__", date_str), ("__GEN__", gen_str), ("__BODY__", body),
-        ("__FACTS__", facts), ("__WHY__", why_text(story)),
-        ("__CHIPS__", stats_chips(data.get("stats"))),
+        ("__BRAND__", brand), ("__OTHER__", other), ("__OTHERLABEL__", other_label),
+        ("__DATELINE__", dateline), ("__BODY__", body),
+        ("__FACTS__", facts), ("__NOTELABEL__", notelabel),
+        ("__WHY__", why_text(story, lang)),
+        ("__CHIPS__", stats_chips(data.get("stats"), lang)),
         ("__OTHERS__", render_others(others or [], lang)),
-        ("__SOURCES__", sources_line(story)),
+        ("__SOURCES__", sources_line(story, lang)),
+        ("__FOOTER__", footer),
         ("__URGENTTEXT__", urgent_text),
     ):
         html = html.replace(tok, str(val))
