@@ -49,10 +49,99 @@ def load_all():
         "maritime": safe_get("maritime"),
         "space": safe_get("space-weather"),
         "flights": safe_get("flights"),
+        "fires": safe_get("fires"),
     }
 
 
 # ------------------------------------------------------------- story pick
+
+# Southern Africa bounding boxes (lat_min, lat_max, lng_min, lng_max).
+# Order matters: a detection is attributed to the FIRST box that contains it,
+# so border fires (e.g. Angola/DRC) are not double-counted in the roll-up.
+SOUTHERN_AFRICA = {
+    "Angola": (-18.2, -4.4, 11.6, 24.2),
+    "Zambia": (-18.1, -8.2, 21.9, 33.8),
+    "Zimbabwe": (-22.5, -15.5, 25.1, 33.2),
+    "Botswana": (-27.0, -17.7, 19.8, 29.5),
+    "Namibia": (-29.1, -16.9, 11.6, 25.4),
+    "Mozambique": (-27.0, -10.4, 30.1, 41.6),
+    "Malawi": (-17.2, -9.3, 32.6, 36.0),
+    "South Africa": (-34.9, -22.0, 16.4, 33.0),
+    "Madagascar": (-25.7, -11.8, 43.1, 50.6),
+    "DRC (south)": (-13.6, -5.0, 12.0, 31.4),
+}
+FIRE_SOURCE_URL = "https://firms.modaps.eosdis.nasa.gov/active_fire/"
+
+
+def fire_candidates(data):
+    """NASA FIRMS active-fire detections (OSIRIS /api/fires), aggregated over
+    southern Africa. Produces one candidate per affected country plus a regional
+    roll-up. The feed mixes current detections with stray historical records, so
+    only the two most recent dates present in the payload are counted."""
+    f = data.get("fires")
+    if not isinstance(f, dict) or not f.get("fires"):
+        return []
+    fires = f["fires"]
+    days = sorted({x.get("date") for x in fires if x.get("date")})
+    if not days:
+        return []
+    window = set(days[-2:])
+    recent = [x for x in fires if x.get("date") in window]
+    if not recent:
+        return []
+
+    def in_box(x, b):
+        return b[0] <= x.get("lat", 99) <= b[1] and b[2] <= x.get("lng", 999) <= b[3]
+
+    # unique attribution: each detection belongs to its first containing box
+    assigned = {name: [] for name in SOUTHERN_AFRICA}
+    for x in recent:
+        for name, b in SOUTHERN_AFRICA.items():
+            if in_box(x, b):
+                assigned[name].append(x)
+                break
+
+    per_country = []
+    for name, sub in assigned.items():
+        if not sub:
+            continue
+        hc = sum(1 for x in sub if x.get("confidence") == "high")
+        frp = sum(x.get("frp") or 0 for x in sub)
+        per_country.append({"name": name, "count": len(sub),
+                            "high_conf": hc, "frp": round(frp, 1)})
+    per_country.sort(key=lambda c: -c["count"])
+    if not per_country:
+        return []
+
+    total = sum(c["count"] for c in per_country)
+    total_hc = sum(c["high_conf"] for c in per_country)
+    total_frp = sum(c["frp"] for c in per_country)
+    window_str = f"{min(window)} – {max(window)}"
+    top_str = ", ".join(f"{c['name']} ({c['count']})" for c in per_country[:4])
+
+    out = [{
+        "kind": "fire", "score": 6 + min(6, total / 100), "ts": 0,
+        "raw": {"name": "southern Africa wildfires", "region": "southern Africa",
+                "count": total, "high_conf": total_hc, "frp": round(total_frp, 1),
+                "per_country": per_country[:6], "window": window_str,
+                "global_total": f.get("total"), "source": f.get("source", "NASA FIRMS"),
+                "sourceUrl": FIRE_SOURCE_URL},
+        "headline_zh": f"南部非洲野火活跃：{total} 处火点",
+        "headline_en": f"Wildfires across southern Africa: {total} detections",
+    }]
+    for c in per_country:
+        out.append({
+            "kind": "fire", "score": 6 + min(4, c["count"] / 60), "ts": 0,
+            "raw": {"name": f"{c['name']} wildfires", "region": c["name"],
+                    "count": c["count"], "high_conf": c["high_conf"],
+                    "frp": c["frp"], "window": window_str,
+                    "source": f.get("source", "NASA FIRMS"),
+                    "sourceUrl": FIRE_SOURCE_URL},
+            "headline_zh": f"野火：{c['name']} {c['count']} 处火点",
+            "headline_en": f"Wildfires in {c['name']}: {c['count']} detections",
+        })
+    return out
+
 
 def candidates(data):
     """Return a list of candidate stories, each with a numeric score (higher = more notable)."""
@@ -131,6 +220,9 @@ def candidates(data):
             "headline_en": f"GPS jamming active: {len(f['gps_jamming'])} reports",
         })
 
+    # --- wildfires (NASA FIRMS active-fire detections via /api/fires) ---
+    out.extend(fire_candidates(data))
+
     out.sort(key=lambda x: (-x["score"], -x.get("ts", 0)))
     return out
 
@@ -160,6 +252,7 @@ def family_of(kind):
         "space": "space",
         "flare": "space",
         "jamming": "jamming",
+        "fire": "fire",
     }.get(kind, "other")
 
 
@@ -175,6 +268,8 @@ def family_from_headline_en(en):
         return "space"
     if en.startswith("GPS jamming"):
         return "jamming"
+    if "wildfire" in en.lower():
+        return "fire"
     return "other"
 
 
@@ -384,6 +479,39 @@ def narrate(story, data):
         facts_zh = [("干扰点数量", str(n)), ("数据源", raw.get("source", "opensky"))]
         facts_en = [("Jamming points", str(n)), ("Source", raw.get("source", "opensky"))]
 
+    elif kind == "fire":
+        n = raw.get("count", 0)
+        hc = raw.get("high_conf", 0)
+        frp = raw.get("frp", 0)
+        win = raw.get("window", "-")
+        top = raw.get("per_country", [])
+        top_str = "、".join(f"{c['name']} {c['count']} 处" for c in top[:4])
+        top_str_en = ", ".join(f"{c['name']} {c['count']}" for c in top[:4])
+        zh.append(f"南部非洲正经历一轮活跃野火季。在 {win} 的观测窗口内，卫星共在该区域捕获 {n} 处火点，"
+                  f"其中高置信度 {hc} 处，累计火辐射功率（FRP）约 {frp:.0f} MW。")
+        zh.append(f"火点最集中的地区依次为：{top_str}。"
+                  "这一带每年 6–10 月为干季，烧荒与自然火叠加，跨境烟雾常影响区域空气质量与航空。")
+        en.append(f"Southern Africa is in an active fire season. Within the {win} observation window, "
+                  f"satellites detected {n} fire hotspots across the region — {hc} of them high-confidence, "
+                  f"with a combined fire radiative power (FRP) of about {frp:.0f} MW.")
+        en.append(f"The densest concentrations: {top_str_en}. "
+                  "The June–October dry season mixes land-clearing burns with natural fires, and the "
+                  "resulting transboundary haze routinely affects regional air quality and aviation.")
+        g = raw.get("global_total")
+        if g:
+            share = 100.0 * n / g if g else 0
+            zh.append(f"作为参照，同一窗口内全球火点总数为 {g:,} 处，南部非洲约占 {share:.0f}%。")
+            en.append(f"For scale, the same window logged {g:,} detections globally — southern Africa "
+                      f"accounts for roughly {share:.0f}% of them.")
+        facts_zh = [("火点总数", str(n)), ("高置信度", str(hc)),
+                    ("累计辐射功率", f"{frp:.0f} MW"), ("数据窗口", win),
+                    ("最集中地区", top_str or "-"),
+                    ("数据源", "NASA FIRMS (VIIRS) · osirisai.live")]
+        facts_en = [("Detections", str(n)), ("High-confidence", str(hc)),
+                    ("Total FRP", f"{frp:.0f} MW"), ("Window", win),
+                    ("Most affected", top_str_en or "-"),
+                    ("Source", "NASA FIRMS (VIIRS) · osirisai.live")]
+
     return {"zh": zh, "en": en, "facts_zh": facts_zh, "facts_en": facts_en}
 
 
@@ -460,6 +588,7 @@ def why_text(story, lang="zh"):
         "space": "地磁活动影响卫星与通信，强风暴期间高纬度短波与定位会受扰。",
         "flare": "太阳耀斑可扰动高频通信与 GNSS 定位，规模越大、影响越广。",
         "jamming": "GPS 干扰反映局部空域的异常电磁环境，常与军事活动相关。",
+        "fire": "野火季直接牵动区域空气质量、跨境烟雾与生态损失，卫星火点是最早可量化的先行指标之一。",
         "none": "这是当天所有可用信号中显著性最高的一条。",
     }
     en = {
@@ -470,6 +599,7 @@ def why_text(story, lang="zh"):
         "space": "Geomagnetic activity affects satellites and comms; strong storms disrupt high-latitude HF radio and positioning.",
         "flare": "Solar flares disturb HF comms and GNSS positioning; the larger the class, the wider the reach.",
         "jamming": "GPS jamming reveals an anomalous electromagnetic environment in local airspace, often linked to military activity.",
+        "fire": "Fire season drives air quality, transboundary haze and ecological loss — satellite fire detections are one of the earliest quantifiable leading indicators.",
         "none": "This is the single most salient signal among all available feeds for the day.",
     }
     table = zh if lang == "zh" else en
@@ -514,6 +644,7 @@ def render_others(others, lang):
         "maritime": {"zh": "航运", "en": "Maritime"},
         "space": {"zh": "空间天气", "en": "Space weather"},
         "jamming": {"zh": "航空干扰", "en": "Aviation jamming"},
+        "fire": {"zh": "野火", "en": "Wildfires"},
         "other": {"zh": "其他", "en": "Other"},
     }
     items = []

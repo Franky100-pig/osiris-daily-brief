@@ -1,10 +1,10 @@
 {
   "date": "2026-10-22",
-  "family": "jamming",
-  "kind": "jamming",
-  "headline_en": "GPS jamming active: 2 reports",
-  "headline_zh": "GPS 干扰活跃：2 处上报",
-  "score": 9,
-  "adj": 9,
-  "urgent": false
+  "family": "fire",
+  "kind": "fire",
+  "headline_en": "Wildfires across southern Africa: 563 detections",
+  "headline_zh": "南部非洲野火活跃：563 处火点",
+  "score": 11.629999999999999,
+  "adj": 11.629999999999999,
+  "urgent": true
 }
