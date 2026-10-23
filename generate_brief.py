@@ -805,13 +805,33 @@ def main():
             content["zh"].insert(0, "⚠ 这是一则突发进展，以下内容为公开 OSIRIS feed 在当前时间点的快照。")
         else:
             story = pick_story(cands, recent_families)
-            pen = story.get("penalty", 0)
-            lpen = story.get("label_penalty", 0)
-            switched = story is not cands[0]
-            tag = f" (raw {story['score']}, -{pen} family, -{lpen} same-headline)"
-            tag += " [family-switch: recent top family repeated]" if switched else ""
-            print(f"[*] picked: {story['headline_en']} (adj {story['adj']}{tag})")
-            content = narrate(story, data)
+            # Auto-breaking rule (user, 2026-10-23): NOT every conflict is breaking
+            # — only those with new developments. A live conflict_event is itself a
+            # new development; a standing zone counts as new only if OSIRIS attached
+            # fresh headlines (news of movement) to it. Natural disasters etc. stay
+            # normal unless their impact is large.
+            def _has_new_dev(c):
+                raw = c.get("raw") or {}
+                return bool([h for h in (raw.get("headlines") or []) if h.get("title")])
+            auto_break = (story["kind"] == "conflict_event") or (
+                story["kind"] == "conflict" and _has_new_dev(story))
+            if auto_break and not urgent:
+                urgent = True
+                story["urgent"] = True
+                story["headline_en"] = re.sub(r'^Live event:\s*', '', story["headline_en"])
+                story["headline_zh"] = re.sub(r'^实时战况：\s*', '', story["headline_zh"])
+                content = narrate(story, data)
+                content["en"].insert(0, "This is a fast-moving situation — the details below are a point-in-time snapshot from public OSIRIS feeds.")
+                content["zh"].insert(0, "⚠ 这是一则突发进展，以下内容为公开 OSIRIS feed 在当前时间点的快照。")
+                print(f"[*] CONFLICT auto-breaking: {story['headline_en']}")
+            else:
+                pen = story.get("penalty", 0)
+                lpen = story.get("label_penalty", 0)
+                switched = story is not cands[0]
+                tag = f" (raw {story['score']}, -{pen} family, -{lpen} same-headline)"
+                tag += " [family-switch: recent top family repeated]" if switched else ""
+                print(f"[*] picked: {story['headline_en']} (adj {story['adj']}{tag})")
+                content = narrate(story, data)
 
     # "other signals" snapshot: the top candidate of every family except the chosen one
     others = []
