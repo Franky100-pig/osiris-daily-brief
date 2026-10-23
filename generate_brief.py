@@ -438,6 +438,20 @@ def narrate(story, data):
             # reliably translate offline, so it is shown only on the EN page to
             # keep the ZH page free of English prose.
             facts_en.append(("Description", desc))
+        # Zone headlines (e.g. an NYT story tied to this conflict) are English
+        # data from OSIRIS — EN page only, per the language policy. Never
+        # invented: we only echo titles/urls exactly as the feed provides them.
+        heads = [h for h in (z.get("headlines") or []) if h.get("title")]
+        for h in heads[:3]:
+            t, u, s = h.get("title", ""), h.get("url", ""), h.get("source", "")
+            val = f'<a href="{u}">{t}</a>' if u else t
+            if s:
+                val += f" — {s}"
+            facts_en.append(("In the news", val))
+        if heads:
+            top = heads[0]
+            en.append(f"In the news: \"{top.get('title', '')}\""
+                      + (f" ({top.get('source')})" if top.get("source") else "") + ".")
 
     elif kind == "port":
         port = raw
