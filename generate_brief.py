@@ -426,6 +426,43 @@ def find_urgent(cands, keyword):
     return hits[0]
 
 
+# ----------------------------------------------------------------- low urgent bar
+# User 2026-10-24: feature what the user points at, but the urgent/badge is EARNED at
+# a modest bar — not every pointed-at item is breaking. The conflict rule from
+# 2026-10-23 still holds: a standing conflict zone breaks only with a NEW development
+# (fresh headline), never just for being a standing war. Other families break at a
+# low threshold so genuine hazards surface as breaking without manual nudging.
+URGENT_MIN_SCORE = 6          # fallback: adjusted score at/above this counts as breaking
+URGENT_CHOKE_RISK = {"HIGH", "SEVERE", "CRITICAL"}   # maritime chokepoint risk bar
+URGENT_QUAKE_MAG = 5.5        # M >= 5.5 earthquake breaks
+
+
+def is_urgent_for(story):
+    """Low-threshold 'breaking' test. Returns True when the story clears the modest
+    bar above. Conflict keeps the 2026-10-23 requirement of a fresh development."""
+    k = story.get("kind")
+    raw = story.get("raw") or {}
+    if k == "conflict_event":
+        return True
+    if k == "conflict":
+        heads = [h for h in (raw.get("headlines") or []) if h.get("title")]
+        return bool(heads)                       # new development required
+    if k == "chokepoint":
+        return (raw.get("risk") or "").upper() in URGENT_CHOKE_RISK
+    if k == "quake":
+        try:
+            return float(raw.get("magnitude", 0)) >= URGENT_QUAKE_MAG
+        except (TypeError, ValueError):
+            return False
+    if k == "flare":
+        return (raw.get("class") or "A0")[0] in ("X", "M")
+    if k == "jamming":
+        return bool(raw.get("gps_jamming"))
+    if k == "port":
+        return (raw.get("congestion") or "").upper() in ("SEVERE", "CRITICAL")
+    return (story.get("adj") or story.get("score", 0)) >= URGENT_MIN_SCORE
+
+
 # ------------------------------------------------------------- narration
 
 def narrate(story, data):
@@ -893,35 +930,33 @@ def main():
     else:
         if urgent and urgent_story:
             story = urgent_story
-            story["urgent"] = True
+            # Feature what the user pointed at, but the urgent/badge is earned at a
+            # LOW bar (user 2026-10-24) — not every pointed-at item is breaking.
+            story["urgent"] = is_urgent_for(story)
             # strip the generic "Live event:" / "实时战况：" prefix for a clean headline
             story["headline_en"] = re.sub(r'^Live event:\s*', '', story["headline_en"])
             story["headline_zh"] = re.sub(r'^实时战况：\s*', '', story["headline_zh"])
-            print(f"[*] URGENT override: {story['headline_en']}")
+            tag = "BREAKING" if story["urgent"] else "featured"
+            print(f"[*] {tag} (--urgent match): {story['headline_en']}")
             content = narrate(story, data)
-            content["en"].insert(0, "This is a fast-moving situation — the details below are a point-in-time snapshot from public OSIRIS feeds.")
-            content["zh"].insert(0, "⚠ 这是一则突发进展，以下内容为公开 OSIRIS feed 在当前时间点的快照。")
+            if story["urgent"]:
+                content["en"].insert(0, "This is a fast-moving situation — the details below are a point-in-time snapshot from public OSIRIS feeds.")
+                content["zh"].insert(0, "⚠ 这是一则突发进展，以下内容为公开 OSIRIS feed 在当前时间点的快照。")
         else:
             story = pick_story(cands, recent_families)
-            # Auto-breaking rule (user, 2026-10-23): NOT every conflict is breaking
-            # — only those with new developments. A live conflict_event is itself a
-            # new development; a standing zone counts as new only if OSIRIS attached
-            # fresh headlines (news of movement) to it. Natural disasters etc. stay
-            # normal unless their impact is large.
-            def _has_new_dev(c):
-                raw = c.get("raw") or {}
-                return bool([h for h in (raw.get("headlines") or []) if h.get("title")])
-            auto_break = (story["kind"] == "conflict_event") or (
-                story["kind"] == "conflict" and _has_new_dev(story))
+            # Auto-breaking at a LOW bar (user 2026-10-24). Conflict still honours the
+            # 2026-10-23 rule via is_urgent_for(): a standing zone breaks only with a
+            # fresh headline (new development); other families break at a modest
+            # threshold (chokepoint risk >= HIGH, M >= 5.5 quake, X/M flare, etc.).
+            auto_break = is_urgent_for(story)
             if auto_break and not urgent:
-                urgent = True
                 story["urgent"] = True
                 story["headline_en"] = re.sub(r'^Live event:\s*', '', story["headline_en"])
                 story["headline_zh"] = re.sub(r'^实时战况：\s*', '', story["headline_zh"])
                 content = narrate(story, data)
                 content["en"].insert(0, "This is a fast-moving situation — the details below are a point-in-time snapshot from public OSIRIS feeds.")
                 content["zh"].insert(0, "⚠ 这是一则突发进展，以下内容为公开 OSIRIS feed 在当前时间点的快照。")
-                print(f"[*] CONFLICT auto-breaking: {story['headline_en']}")
+                print(f"[*] auto-breaking: {story['headline_en']}")
             else:
                 pen = story.get("penalty", 0)
                 lpen = story.get("label_penalty", 0)
