@@ -192,6 +192,19 @@ def candidates(data):
                     "headline_en": f"Port congestion: {port.get('name')} ({port.get('country')}) — {cong}",
                 })
 
+    # --- chokepoint risk (maritime chokepoints from /api/maritime) ---
+    if isinstance(p, dict):
+        for cp in p.get("chokepoints", []):
+            risk = (cp.get("risk") or "").upper()
+            if risk in CHOKEPOINT_WEIGHTS:
+                w = CHOKEPOINT_WEIGHTS[risk]
+                risk_zh = RISK_ZH.get(risk, risk)
+                out.append({
+                    "kind": "chokepoint", "score": w, "ts": 0, "raw": cp,
+                    "headline_zh": f"咽喉要道：{cp.get('name')} —— 风险{risk_zh}",
+                    "headline_en": f"Chokepoint alert: {cp.get('name')} — {risk} risk",
+                })
+
     # --- space weather ---
     s = data["space"]
     if isinstance(s, dict):
@@ -242,6 +255,22 @@ LABEL_RECENCY_PENALTY = 7   # points off if the exact same headline_en appeared 
 MAX_LABEL_PENALTY_DAYS = 2  # cap the per-headline penalty so it can't drop below everything
 
 
+# --- chokepoint risk weights + nearby-war context (maritime /api/maritime) ---
+CHOKEPOINT_WEIGHTS = {"ELEVATED": 6, "HIGH": 8, "SEVERE": 10, "CRITICAL": 12}
+RISK_ZH = {"ELEVATED": "升高", "HIGH": "高", "SEVERE": "严重", "CRITICAL": "危急"}
+NEARBY_WAR_RADIUS_KM = 800
+
+
+def _haversine_km(lat1, lng1, lat2, lng2):
+    """Great-circle distance in km between two lat/lng points."""
+    from math import radians, sin, cos, asin, sqrt
+    r = 6371.0
+    p1, p2 = radians(lat1), radians(lat2)
+    dp, dl = radians(lat2 - lat1), radians(lng2 - lng1)
+    a = sin(dp / 2) ** 2 + cos(p1) * cos(p2) * sin(dl / 2) ** 2
+    return 2 * r * asin(sqrt(a))
+
+
 def family_of(kind):
     """Map a story kind to a coarse topic family used for de-duplication."""
     return {
@@ -249,6 +278,7 @@ def family_of(kind):
         "conflict": "conflict",
         "conflict_event": "conflict",
         "port": "maritime",
+        "chokepoint": "maritime",
         "space": "space",
         "flare": "space",
         "jamming": "jamming",
@@ -263,6 +293,8 @@ def family_from_headline_en(en):
     if "earthquake" in en:
         return "quake"
     if en.startswith("Port congestion"):
+        return "maritime"
+    if en.startswith("Chokepoint alert"):
         return "maritime"
     if en.startswith("Geomagnetic activity") or en.startswith("Solar flare"):
         return "space"
@@ -466,6 +498,70 @@ def narrate(story, data):
                     ("Congestion", port.get("congestion")), ("Rank", f"#{port.get('rank')}"),
                     ("Dwell", port.get("dwell_time") or "-")]
 
+    elif kind == "chokepoint":
+        cp = raw
+        name = cp.get("name") or "chokepoint"
+        risk = (cp.get("risk") or "-").upper()
+        risk_zh = RISK_ZH.get(risk, risk)
+        traffic = cp.get("traffic") or "-"
+        zh.append(f"航运咽喉「{name}」当前风险等级为「{risk_zh}」，实时流量读数：{traffic}。")
+        zh.append("咽喉水道是全球能源与贸易的单点节点，一旦受阻，绕行成本会立刻传导到油运与集运价格上。")
+        en.append(f"Maritime chokepoint \"{name}\" is rated {risk} risk; traffic reading: {traffic}.")
+        en.append("Chokepoints are single points of failure for energy and trade — disruption feeds "
+                  "straight into rerouting costs, tanker rates and container freight.")
+        facts_zh = [("要道", name), ("风险等级", risk_zh), ("流量", traffic)]
+        facts_en = [("Chokepoint", name), ("Risk", risk), ("Traffic", traffic)]
+        # Nearby-war context: conflict zones geographically close to this chokepoint,
+        # pulled straight from the conflicts feed — distances computed, nothing invented.
+        try:
+            lat0, lng0 = float(cp.get("lat")), float(cp.get("lng"))
+        except (TypeError, ValueError):
+            lat0 = lng0 = None
+        if lat0 is not None:
+            conf = (data or {}).get("conflicts")
+            zones = conf.get("zones", []) if isinstance(conf, dict) else []
+            near = []
+            for z in zones:
+                # "Nearby WAR context": only actual conflict zones (war/high severity),
+                # so low-level "elevated" instability zones don't dilute the picture.
+                if (z.get("severity") or "").lower() not in ("war", "high"):
+                    continue
+                try:
+                    d_km = _haversine_km(lat0, lng0, float(z.get("lat")), float(z.get("lng")))
+                except (TypeError, ValueError):
+                    continue
+                if d_km <= NEARBY_WAR_RADIUS_KM:
+                    near.append((d_km, z))
+            near.sort(key=lambda x: x[0])
+            if near:
+                labels_zh = "、".join(z.get("label") or "?" for _, z in near)
+                en_names = [z.get("label") or "?" for _, z in near]
+                labels_en = (", ".join(en_names[:-1]) + " and " + en_names[-1]) if len(en_names) > 2 else " and ".join(en_names)
+                zh.append(f"把镜头拉远一点：{labels_zh} 就在这条水道旁边——这一线的航运风险，"
+                          "本质上是岸边战事在海上的延伸。")
+                en.append(f"Zoom out and the picture is explicit: {labels_en} sit right on this "
+                          "waterway — the shipping risk along this line is the maritime face of "
+                          "the wars on shore.")
+                facts_zh.append(("邻近战区", labels_zh))
+                facts_en.append(("Nearby war zones", labels_en))
+                heads = []
+                for _, z in near:
+                    for h in (z.get("headlines") or []):
+                        if h.get("title"):
+                            heads.append((z.get("label") or "", h))
+                # Zone headlines are English data from OSIRIS — EN page only, per the
+                # language policy. Echoed exactly as the feed provides them.
+                for zlabel, h in heads[:3]:
+                    t, u, s = h.get("title", ""), h.get("url", ""), h.get("source", "")
+                    val = f'<a href="{u}">{t}</a>' if u else t
+                    if s:
+                        val += f" — {s}"
+                    facts_en.append((f"In the news ({zlabel})" if zlabel else "In the news", val))
+                if heads:
+                    top = heads[0][1]
+                    en.append(f"In the news: \"{top.get('title', '')}\""
+                              + (f" ({top.get('source')})" if top.get("source") else "") + ".")
+
     elif kind in ("space", "flare"):
         s = raw
         if kind == "flare":
@@ -599,6 +695,7 @@ def why_text(story, lang="zh"):
         "conflict": "冲突热点直接关联航运咽喉、能源与难民流动，是地缘与市场的早期信号。",
         "conflict_event": "实时战况事件往往先于主流媒体报道，是开源情报的价值所在。",
         "port": "主要港口拥堵会沿供应链放大，影响交付周期与运价，是宏观与贸易的先行指标。",
+        "chokepoint": "咽喉要道是全球能源与贸易的单点节点，其风险等级变化先于运价与保费反应，是地缘紧张最直接的量化读数之一。",
         "space": "地磁活动影响卫星与通信，强风暴期间高纬度短波与定位会受扰。",
         "flare": "太阳耀斑可扰动高频通信与 GNSS 定位，规模越大、影响越广。",
         "jamming": "GPS 干扰反映局部空域的异常电磁环境，常与军事活动相关。",
@@ -610,6 +707,7 @@ def why_text(story, lang="zh"):
         "conflict": "Conflict hotspots are tied directly to shipping chokepoints, energy and migration — early signals for geopolitics and markets.",
         "conflict_event": "Live conflict events often break ahead of mainstream coverage — the core value of open-source intelligence.",
         "port": "Major-port congestion cascades through supply chains, hitting lead times and freight rates — a leading macro and trade indicator.",
+        "chokepoint": "Chokepoints are single points of failure for global energy and trade; their risk rating moves ahead of freight rates and war-risk premiums — one of the most direct quantified readings of geopolitical tension.",
         "space": "Geomagnetic activity affects satellites and comms; strong storms disrupt high-latitude HF radio and positioning.",
         "flare": "Solar flares disturb HF comms and GNSS positioning; the larger the class, the wider the reach.",
         "jamming": "GPS jamming reveals an anomalous electromagnetic environment in local airspace, often linked to military activity.",
