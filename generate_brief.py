@@ -254,6 +254,13 @@ MIN_ALT_SCORE = 5         # an alternative family must score at least this to re
 LABEL_RECENCY_PENALTY = 7   # points off if the exact same headline_en appeared recently
 MAX_LABEL_PENALTY_DAYS = 2  # cap the per-headline penalty so it can't drop below everything
 
+# Consecutive-family rule (user 2026-10-28): never broadcast the SAME topic family two
+# days running. A candidate whose family matches the most-recently-posted day gets a stiff
+# extra penalty so the algorithm prefers a different family. We still allow a repeat only
+# when literally every other family is below a sane floor (a dead news day).
+CONSEC_FAMILY_PENALTY = 6   # points off if the candidate's family == yesterday's post family
+CONSEC_ALT_FLOOR = 4.0      # min adjusted score for a replacement family to justify switching
+
 
 # --- chokepoint risk weights + nearby-war context (maritime /api/maritime) ---
 CHOKEPOINT_WEIGHTS = {"ELEVATED": 6, "HIGH": 8, "SEVERE": 10, "CRITICAL": 12}
@@ -371,10 +378,41 @@ def load_recent_headlines(posts_dir, today, window=RECENCY_WINDOW):
     return cnt
 
 
-def apply_recency(cands, family_counts, headline_counts=None):
-    """Re-sort candidates after penalising recently-shown families (topic variety)
-    AND recently-shown specific headlines (so the SAME standing story, e.g. UKRAINE
-    WAR, cannot repeat day after day)."""
+def load_prev_family(posts_dir, today):
+    """Return the family of the most-recently-posted day BEFORE `today`, used for the
+    'do not broadcast the same type two days running' rule. Dates are YYYY-MM-DD so a
+    plain lexical compare works. Returns None if no earlier post / family can't be read."""
+    if not os.path.isdir(posts_dir):
+        return None
+    days = sorted(
+        d for d in os.listdir(posts_dir)
+        if d < today and os.path.isfile(os.path.join(posts_dir, d, "index.zh.html"))
+    )
+    if not days:
+        return None
+    prev = days[-1]
+    meta = os.path.join(posts_dir, prev, "meta.json")
+    if os.path.isfile(meta):
+        try:
+            return json.load(open(meta, encoding="utf-8")).get("family")
+        except Exception:
+            pass
+    en = os.path.join(posts_dir, prev, "index.en.html")
+    if os.path.isfile(en):
+        try:
+            m = _H1_RE.search(open(en, encoding="utf-8").read())
+            if m:
+                return family_from_headline_en(m.group(1).strip())
+        except Exception:
+            pass
+    return None
+
+
+def apply_recency(cands, family_counts, headline_counts=None, prev_family=None):
+    """Re-sort candidates after penalising recently-shown families (topic variety),
+    recently-shown specific headlines (so the SAME standing story, e.g. UKRAINE WAR,
+    cannot repeat day after day), AND — with a stiff extra penalty — the family that was
+    the headline just yesterday (user 2026-10-28: never repeat the same type consecutively)."""
     headline_counts = headline_counts or {}
     for c in cands:
         fam = family_of(c["kind"])
@@ -382,17 +420,25 @@ def apply_recency(cands, family_counts, headline_counts=None):
         c["penalty"] = min(family_counts.get(fam, 0), MAX_PENALTY_DAYS) * RECENCY_PENALTY
         hc = headline_counts.get(c["headline_en"], 0)
         c["label_penalty"] = min(hc, MAX_LABEL_PENALTY_DAYS) * LABEL_RECENCY_PENALTY
-        c["adj"] = c["score"] - c["penalty"] - c["label_penalty"]
+        c["consec_penalty"] = CONSEC_FAMILY_PENALTY if (prev_family and fam == prev_family) else 0
+        c["adj"] = c["score"] - c["penalty"] - c["label_penalty"] - c["consec_penalty"]
     cands.sort(key=lambda x: (-x["adj"], -x["score"], -x.get("ts", 0)))
     return cands
 
 
-def pick_story(cands, recent_families):
+def pick_story(cands, recent_families, prev_family=None):
     """Pick the top candidate, but if its family was shown recently, switch to the
-    best candidate from a different family so the same topic doesn't repeat daily."""
+    best candidate from a different family so the same topic doesn't repeat daily.
+    A candidate matching YESTERDAY's family is avoided even harder (user 2026-10-28):
+    we switch to any other family with adjusted score >= CONSEC_ALT_FLOOR, only falling
+    back to the repeated family on a genuinely dead news day (no alternative clears the floor)."""
     if not cands:
         return None
     top = cands[0]
+    if prev_family and top["family"] == prev_family:
+        for c in cands[1:]:
+            if c["family"] != prev_family and c["adj"] >= CONSEC_ALT_FLOOR:
+                return c
     if recent_families.get(top["family"], 0) == 0:
         return top
     for c in cands:
@@ -903,11 +949,12 @@ def main():
 
     recent_families = load_recent_families(os.path.join(ROOT, "posts"), today)
     recent_headlines = load_recent_headlines(os.path.join(ROOT, "posts"), today)
+    prev_family = load_prev_family(os.path.join(ROOT, "posts"), today)
 
     print(f"[*] fetching OSIRIS feeds for {today} ...")
     data = load_all()
     cands = candidates(data)
-    cands = apply_recency(cands, recent_families, recent_headlines)
+    cands = apply_recency(cands, recent_families, recent_headlines, prev_family)
 
     # --- urgent override (explicit instruction only; algorithm otherwise untouched) ---
     urgent = bool(a.urgent)
@@ -943,7 +990,7 @@ def main():
                 content["en"].insert(0, "This is a fast-moving situation — the details below are a point-in-time snapshot from public OSIRIS feeds.")
                 content["zh"].insert(0, "⚠ 这是一则突发进展，以下内容为公开 OSIRIS feed 在当前时间点的快照。")
         else:
-            story = pick_story(cands, recent_families)
+            story = pick_story(cands, recent_families, prev_family)
             # Auto-breaking at a LOW bar (user 2026-10-24). Conflict still honours the
             # 2026-10-23 rule via is_urgent_for(): a standing zone breaks only with a
             # fresh headline (new development); other families break at a modest
@@ -960,9 +1007,13 @@ def main():
             else:
                 pen = story.get("penalty", 0)
                 lpen = story.get("label_penalty", 0)
+                cpen = story.get("consec_penalty", 0)
                 switched = story is not cands[0]
-                tag = f" (raw {story['score']}, -{pen} family, -{lpen} same-headline)"
-                tag += " [family-switch: recent top family repeated]" if switched else ""
+                tag = f" (raw {story['score']}, -{pen} family, -{lpen} same-headline, -{cpen} consec)"
+                if prev_family and story.get("family") == prev_family:
+                    tag += " [consec: repeated yesterday's family]"
+                elif switched:
+                    tag += " [family-switch: recent top family repeated]"
                 print(f"[*] picked: {story['headline_en']} (adj {story['adj']}{tag})")
                 content = narrate(story, data)
 
