@@ -70,14 +70,106 @@ SOUTHERN_AFRICA = {
     "Madagascar": (-25.7, -11.8, 43.1, 50.6),
     "DRC (south)": (-13.6, -5.0, 12.0, 31.4),
 }
+# Northeast China (Dongbei) bounding boxes — Heilongjiang / Jilin / Liaoning.
+# Dict order matters: first containing box wins, so border detections are not
+# double-counted in the roll-up.
+NORTHEAST_CHINA = {
+    "Heilongjiang": (43.4, 53.6, 121.2, 135.1),
+    "Jilin":        (40.8, 46.3, 121.6, 131.3),
+    "Liaoning":     (38.7, 43.4, 118.8, 125.8),
+}
+NE_CHINA_ZH = {"Heilongjiang": "黑龙江", "Jilin": "吉林", "Liaoning": "辽宁"}
 FIRE_SOURCE_URL = "https://firms.modaps.eosdis.nasa.gov/active_fire/"
+
+# Per-region narration context (seasonal background used by the narrate() fire branch).
+FIRE_REGIONS = {
+    "southern Africa": {
+        "region_zh": "南部非洲",
+        "season_zh": "这一带每年 6–10 月为干季，烧荒与自然火叠加，跨境烟雾常影响区域空气质量与航空。",
+        "season_en": "The June–October dry season mixes land-clearing burns with natural fires, and the "
+                     "resulting transboundary haze routinely affects regional air quality and aviation.",
+    },
+    "Northeast China": {
+        "region_zh": "中国东北",
+        "season_zh": "东北秋季降水减少、天干物燥，正值秋收后烧荒与森林火险高发期，烟雾会影响本地空气质量与交通。",
+        "season_en": "Autumn brings dry weather to the region, and the post-harvest period is a peak "
+                     "window for agricultural burning and forest-fire risk; the resulting smoke affects "
+                     "local air quality and transport.",
+    },
+}
+
+
+def _fire_region_candidates(fires, window, boxes, region_en, name_zh=None,
+                            global_total=None, source="NASA FIRMS"):
+    """Aggregate one region's recent detections into candidates: a regional
+    roll-up plus one candidate per affected sub-region. Each detection is
+    attributed to its first containing box (no double counting)."""
+    def in_box(x, b):
+        return b[0] <= x.get("lat", 99) <= b[1] and b[2] <= x.get("lng", 999) <= b[3]
+
+    assigned = {name: [] for name in boxes}
+    for x in fires:
+        for name, b in boxes.items():
+            if in_box(x, b):
+                assigned[name].append(x)
+                break
+
+    per = []
+    for name, sub in assigned.items():
+        if not sub:
+            continue
+        hc = sum(1 for x in sub if x.get("confidence") == "high")
+        frp = sum(x.get("frp") or 0 for x in sub)
+        per.append({"name": name, "name_zh": (name_zh or {}).get(name, name),
+                    "count": len(sub), "high_conf": hc, "frp": round(frp, 1)})
+    per.sort(key=lambda c: -c["count"])
+    if not per:
+        return []
+
+    total = sum(c["count"] for c in per)
+    total_hc = sum(c["high_conf"] for c in per)
+    total_frp = sum(c["frp"] for c in per)
+    window_str = (f"{min(window)} – {max(window)}" if len(window) > 1
+                  else next(iter(window)))
+    ctx = FIRE_REGIONS.get(region_en, {})
+    region_zh = ctx.get("region_zh", region_en)
+    # the roll-up is at least as notable as its biggest contributing part
+    rollup_score = max(6 + min(6, total / 100),
+                       6 + min(4, per[0]["count"] / 60) + 0.5)
+
+    out = [{
+        "kind": "fire", "score": rollup_score, "ts": 0,
+        "raw": {"name": f"{region_en} wildfires", "region": region_en,
+                "region_zh": region_zh,
+                "season_zh": ctx.get("season_zh"), "season_en": ctx.get("season_en"),
+                "count": total, "high_conf": total_hc, "frp": round(total_frp, 1),
+                "per_country": per[:6], "window": window_str,
+                "global_total": global_total, "source": source,
+                "sourceUrl": FIRE_SOURCE_URL},
+        "headline_zh": f"{region_zh}野火活跃：{total} 处火点",
+        "headline_en": f"Wildfires across {region_en}: {total} detections",
+    }]
+    for c in per:
+        out.append({
+            "kind": "fire", "score": 6 + min(4, c["count"] / 60), "ts": 0,
+            "raw": {"name": f"{c['name']} wildfires", "region": region_en,
+                    "region_zh": region_zh,
+                    "season_zh": ctx.get("season_zh"), "season_en": ctx.get("season_en"),
+                    "count": c["count"], "high_conf": c["high_conf"],
+                    "frp": c["frp"], "window": window_str,
+                    "source": source, "sourceUrl": FIRE_SOURCE_URL},
+            "headline_zh": f"野火：{c['name_zh']} {c['count']} 处火点",
+            "headline_en": f"Wildfires in {c['name']}: {c['count']} detections",
+        })
+    return out
 
 
 def fire_candidates(data):
     """NASA FIRMS active-fire detections (OSIRIS /api/fires), aggregated over
-    southern Africa. Produces one candidate per affected country plus a regional
-    roll-up. The feed mixes current detections with stray historical records, so
-    only the two most recent dates present in the payload are counted."""
+    southern Africa and Northeast China. Produces one candidate per affected
+    sub-region plus a regional roll-up for each. The feed mixes current
+    detections with stray historical records, so only the two most recent dates
+    present in the payload are counted."""
     f = data.get("fires")
     if not isinstance(f, dict) or not f.get("fires"):
         return []
@@ -89,57 +181,23 @@ def fire_candidates(data):
     recent = [x for x in fires if x.get("date") in window]
     if not recent:
         return []
-
-    def in_box(x, b):
-        return b[0] <= x.get("lat", 99) <= b[1] and b[2] <= x.get("lng", 999) <= b[3]
-
-    # unique attribution: each detection belongs to its first containing box
-    assigned = {name: [] for name in SOUTHERN_AFRICA}
+    # a stray historical row can sneak into the 2-date window; drop dates that
+    # hold a negligible share of the freshest date's detections
+    counts = {}
     for x in recent:
-        for name, b in SOUTHERN_AFRICA.items():
-            if in_box(x, b):
-                assigned[name].append(x)
-                break
+        counts[x.get("date")] = counts.get(x.get("date"), 0) + 1
+    freshest = max(counts, key=lambda d: counts[d])
+    floor = max(2, counts[freshest] * 0.01)
+    window = {d for d in window if counts.get(d, 0) >= floor}
+    recent = [x for x in recent if x.get("date") in window]
 
-    per_country = []
-    for name, sub in assigned.items():
-        if not sub:
-            continue
-        hc = sum(1 for x in sub if x.get("confidence") == "high")
-        frp = sum(x.get("frp") or 0 for x in sub)
-        per_country.append({"name": name, "count": len(sub),
-                            "high_conf": hc, "frp": round(frp, 1)})
-    per_country.sort(key=lambda c: -c["count"])
-    if not per_country:
-        return []
-
-    total = sum(c["count"] for c in per_country)
-    total_hc = sum(c["high_conf"] for c in per_country)
-    total_frp = sum(c["frp"] for c in per_country)
-    window_str = f"{min(window)} – {max(window)}"
-    top_str = ", ".join(f"{c['name']} ({c['count']})" for c in per_country[:4])
-
-    out = [{
-        "kind": "fire", "score": 6 + min(6, total / 100), "ts": 0,
-        "raw": {"name": "southern Africa wildfires", "region": "southern Africa",
-                "count": total, "high_conf": total_hc, "frp": round(total_frp, 1),
-                "per_country": per_country[:6], "window": window_str,
-                "global_total": f.get("total"), "source": f.get("source", "NASA FIRMS"),
-                "sourceUrl": FIRE_SOURCE_URL},
-        "headline_zh": f"南部非洲野火活跃：{total} 处火点",
-        "headline_en": f"Wildfires across southern Africa: {total} detections",
-    }]
-    for c in per_country:
-        out.append({
-            "kind": "fire", "score": 6 + min(4, c["count"] / 60), "ts": 0,
-            "raw": {"name": f"{c['name']} wildfires", "region": c["name"],
-                    "count": c["count"], "high_conf": c["high_conf"],
-                    "frp": c["frp"], "window": window_str,
-                    "source": f.get("source", "NASA FIRMS"),
-                    "sourceUrl": FIRE_SOURCE_URL},
-            "headline_zh": f"野火：{c['name']} {c['count']} 处火点",
-            "headline_en": f"Wildfires in {c['name']}: {c['count']} detections",
-        })
+    out = []
+    out.extend(_fire_region_candidates(
+        recent, window, SOUTHERN_AFRICA, "southern Africa",
+        global_total=f.get("total"), source=f.get("source", "NASA FIRMS")))
+    out.extend(_fire_region_candidates(
+        recent, window, NORTHEAST_CHINA, "Northeast China", name_zh=NE_CHINA_ZH,
+        global_total=f.get("total"), source=f.get("source", "NASA FIRMS")))
     return out
 
 
@@ -678,23 +736,27 @@ def narrate(story, data):
         frp = raw.get("frp", 0)
         win = raw.get("window", "-")
         top = raw.get("per_country", [])
-        top_str = "、".join(f"{c['name']} {c['count']} 处" for c in top[:4])
+        top_str = "、".join(f"{c.get('name_zh', c['name'])} {c['count']} 处" for c in top[:4])
         top_str_en = ", ".join(f"{c['name']} {c['count']}" for c in top[:4])
-        zh.append(f"南部非洲正经历一轮活跃野火季。在 {win} 的观测窗口内，卫星共在该区域捕获 {n} 处火点，"
+        region_zh = raw.get("region_zh", "南部非洲")
+        region_en = raw.get("region", "southern Africa")
+        season_zh = raw.get("season_zh") or ("这一带每年 6–10 月为干季，烧荒与自然火叠加，"
+                                             "跨境烟雾常影响区域空气质量与航空。")
+        season_en = raw.get("season_en") or ("The June–October dry season mixes land-clearing burns with "
+                                             "natural fires, and the resulting transboundary haze "
+                                             "routinely affects regional air quality and aviation.")
+        zh.append(f"{region_zh}正经历一轮活跃野火季。在 {win} 的观测窗口内，卫星共在该区域捕获 {n} 处火点，"
                   f"其中高置信度 {hc} 处，累计火辐射功率（FRP）约 {frp:.0f} MW。")
-        zh.append(f"火点最集中的地区依次为：{top_str}。"
-                  "这一带每年 6–10 月为干季，烧荒与自然火叠加，跨境烟雾常影响区域空气质量与航空。")
-        en.append(f"Southern Africa is in an active fire season. Within the {win} observation window, "
+        zh.append(f"火点最集中的地区依次为：{top_str}。{season_zh}")
+        en.append(f"{region_en} is in an active fire season. Within the {win} observation window, "
                   f"satellites detected {n} fire hotspots across the region — {hc} of them high-confidence, "
                   f"with a combined fire radiative power (FRP) of about {frp:.0f} MW.")
-        en.append(f"The densest concentrations: {top_str_en}. "
-                  "The June–October dry season mixes land-clearing burns with natural fires, and the "
-                  "resulting transboundary haze routinely affects regional air quality and aviation.")
+        en.append(f"The densest concentrations: {top_str_en}. {season_en}")
         g = raw.get("global_total")
         if g:
             share = 100.0 * n / g if g else 0
-            zh.append(f"作为参照，同一窗口内全球火点总数为 {g:,} 处，南部非洲约占 {share:.0f}%。")
-            en.append(f"For scale, the same window logged {g:,} detections globally — southern Africa "
+            zh.append(f"作为参照，同一窗口内全球火点总数为 {g:,} 处，{region_zh}约占 {share:.0f}%。")
+            en.append(f"For scale, the same window logged {g:,} detections globally — {region_en} "
                       f"accounts for roughly {share:.0f}% of them.")
         facts_zh = [("火点总数", str(n)), ("高置信度", str(hc)),
                     ("累计辐射功率", f"{frp:.0f} MW"), ("数据窗口", win),
@@ -940,8 +1002,10 @@ def build_index(posted_days):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="YYYY-MM-DD (default: today)")
-    ap.add_argument("--urgent", help="Force a story mentioning KEYWORD as an urgent/breaking headline "
+    ap.add_argument("--urgent", help="Force a story mentioning KEYWORD as the headline "
                                       "(overrides the algorithm). Falls back to the algorithm if no match.")
+    ap.add_argument("--no-urgent", action="store_true",
+                    help="With --urgent: feature the story but never show the breaking badge")
     a = ap.parse_args()
 
     today = a.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -979,7 +1043,8 @@ def main():
             story = urgent_story
             # Feature what the user pointed at, but the urgent/badge is earned at a
             # LOW bar (user 2026-10-24) — not every pointed-at item is breaking.
-            story["urgent"] = is_urgent_for(story)
+            # --no-urgent (user 2026-11-01) forces the featured story to plain news.
+            story["urgent"] = False if a.no_urgent else is_urgent_for(story)
             # strip the generic "Live event:" / "实时战况：" prefix for a clean headline
             story["headline_en"] = re.sub(r'^Live event:\s*', '', story["headline_en"])
             story["headline_zh"] = re.sub(r'^实时战况：\s*', '', story["headline_zh"])
@@ -996,7 +1061,7 @@ def main():
             # fresh headline (new development); other families break at a modest
             # threshold (chokepoint risk >= HIGH, M >= 5.5 quake, X/M flare, etc.).
             auto_break = is_urgent_for(story)
-            if auto_break and not urgent:
+            if auto_break and not urgent and not a.no_urgent:
                 story["urgent"] = True
                 story["headline_en"] = re.sub(r'^Live event:\s*', '', story["headline_en"])
                 story["headline_zh"] = re.sub(r'^实时战况：\s*', '', story["headline_zh"])
