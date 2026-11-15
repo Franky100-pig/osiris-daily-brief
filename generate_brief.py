@@ -936,7 +936,12 @@ def render(lang, story, content, data, date_str, gen_str, others=None, urgent=Fa
               "OSIRIS Daily Brief — auto-generated. Figures are a point-in-time snapshot of public "
               "keyless feeds (USGS, NASA FIRMS, OpenSky, national traffic-camera networks). "
               "Not an authoritative intelligence source.")
-    body = "".join(f"<p>{p}</p>" for p in content[lang])
+    paras = list(content[lang])
+    # region names from the feeds are lowercase in the data ("southern Africa"),
+    # so a lead sentence can open with a lowercase letter — capitalise it.
+    if lang == "en" and paras and paras[0][:1].islower():
+        paras[0] = paras[0][0].upper() + paras[0][1:]
+    body = "".join(f"<p>{p}</p>" for p in paras)
     facts = "".join(f"<tr><td>{k}</td><td>{v if v is not None else ''}</td></tr>"
                     for k, v in content[f"facts_{lang}"])
     html = PAGE
